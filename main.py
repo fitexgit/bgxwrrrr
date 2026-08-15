@@ -5,7 +5,7 @@ import base64
 from pathlib import Path
 from telegram import Update, InputMediaPhoto
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import async_playwright
 
 # ==================== توکن ====================
 TOKEN = "7534267402:AAFaOmAaFbVmdpdC6RjKjV-71evLGVwd5Oc"
@@ -57,42 +57,54 @@ async def generate_with_playwright(prompt: str) -> list[Path]:
         try:
             logger.info("۱. باز کردن صفحه...")
             await page.goto(GENERATOR_URL, wait_until="domcontentloaded", timeout=120000)
-            await page.wait_for_timeout(10000)
+            await page.wait_for_timeout(12000)
 
-            logger.info("۲. پیدا کردن و پر کردن Description...")
+            logger.info("۲. پیدا کردن textareaهای قابل مشاهده...")
 
-            # روش مطمئن‌تر: پیدا کردن textarea نزدیک به متن Description
-            description_textarea = page.locator("text=Description").locator("xpath=following::textarea[1]")
-            await description_textarea.wait_for(state="visible", timeout=20000)
-            await description_textarea.click()
-            await description_textarea.fill("")          # پاک کردن متن قبلی
-            await description_textarea.fill(prompt)
-            logger.info("پرامپت نوشته شد.")
+            # فقط textareaهایی که واقعاً visible هستند
+            visible_textareas = page.locator("textarea:visible")
+            count = await visible_textareas.count()
+            logger.info(f"تعداد textarea visible: {count}")
 
-            # Anti-Description (اختیاری)
-            try:
-                anti = page.locator("text=Anti-Description").locator("xpath=following::input[1], xpath=following::textarea[1]")
-                if await anti.count() > 0:
-                    await anti.first.fill("low quality, blurry, deformed, bad anatomy, extra limbs")
-            except:
-                pass
+            if count == 0:
+                # اگر هیچ‌کدام visible نبود، با force کار می‌کنیم
+                logger.warning("هیچ textarea visible پیدا نشد، از روش force استفاده می‌کنم...")
+                all_textareas = page.locator("textarea")
+                count = await all_textareas.count()
+                logger.info(f"تعداد کل textarea: {count}")
+                if count == 0:
+                    raise Exception("هیچ فیلد متنی پیدا نشد")
+                desc = all_textareas.first
+            else:
+                # معمولاً اولین textarea visible همان Description است
+                desc = visible_textareas.first
+
+            # پر کردن پرامپت (با force برای اطمینان)
+            await desc.click(force=True)
+            await desc.fill("")
+            await desc.fill(prompt, force=True)
+            logger.info("پرامپت با موفقیت نوشته شد.")
+
+            # کمی صبر
+            await page.wait_for_timeout(1000)
 
             logger.info("۳. کلیک روی دکمه Generate...")
 
-            # چند روش برای پیدا کردن دکمه
+            # دکمه Generate
             generate_btn = page.locator("button:has-text('generate')").first
             await generate_btn.wait_for(state="visible", timeout=15000)
-            await generate_btn.click()
+            await generate_btn.click(force=True)
             logger.info("دکمه Generate کلیک شد.")
 
             # صبر برای تولید تصویر
-            logger.info("۴. منتظر ساخت تصاویر (۳ دقیقه)...")
+            logger.info("۴. منتظر ساخت تصاویر (حدود ۳ دقیقه)...")
             await page.wait_for_timeout(180000)
 
             logger.info("۵. جمع‌آوری تصاویر...")
-            # گرفتن همه imgهایی که data:image دارند
-            all_images = await page.locator("img").all()
-            for img in all_images:
+
+            # روش ۱: تصاویر داخل صفحه اصلی
+            imgs = await page.locator("img").all()
+            for img in imgs:
                 try:
                     src = await img.get_attribute("src")
                     if src and src.startswith("data:image"):
@@ -102,16 +114,17 @@ async def generate_with_playwright(prompt: str) -> list[Path]:
                         with open(path, "wb") as f:
                             f.write(data)
                         image_paths.append(path)
-                        logger.info(f"تصویر ذخیره شد → {path.name}")
+                        logger.info(f"تصویر ذخیره شد: {path.name}")
                 except:
                     continue
 
-            # اگر هنوز تصویری پیدا نشد، از فریم‌ها هم چک کن
+            # روش ۲: اگر چیزی پیدا نشد، داخل فریم‌ها بگرد
             if not image_paths:
+                logger.info("در حال جستجو داخل iframeها...")
                 for frame in page.frames:
                     try:
-                        imgs = await frame.locator("img").all()
-                        for img in imgs:
+                        frame_imgs = await frame.locator("img").all()
+                        for img in frame_imgs:
                             src = await img.get_attribute("src")
                             if src and src.startswith("data:image"):
                                 header, encoded = src.split(",", 1)
@@ -120,19 +133,20 @@ async def generate_with_playwright(prompt: str) -> list[Path]:
                                 with open(path, "wb") as f:
                                     f.write(data)
                                 image_paths.append(path)
+                                logger.info(f"تصویر از فریم ذخیره شد: {path.name}")
                     except:
                         continue
 
             if not image_paths:
                 await page.screenshot(path=OUTPUT_DIR / "debug_no_images.png", full_page=True)
-                logger.warning("هیچ تصویری پیدا نشد. اسکرین‌شات ذخیره شد.")
+                logger.warning("هیچ تصویری پیدا نشد.")
 
         except Exception as e:
             try:
                 await page.screenshot(path=OUTPUT_DIR / "debug_error.png", full_page=True)
             except:
                 pass
-            raise Exception(f"خطا: {str(e)}")
+            raise Exception(str(e))
         finally:
             await browser.close()
 
@@ -153,7 +167,7 @@ async def handle_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         image_paths = await generate_with_playwright(prompt)
 
         if not image_paths:
-            await status_msg.edit_text("❌ تصویری ساخته نشد. چند دقیقه دیگر دوباره امتحان کن.")
+            await status_msg.edit_text("❌ تصویری ساخته نشد.\nچند دقیقه دیگر دوباره امتحان کن.")
             return
 
         media = []
@@ -167,7 +181,10 @@ async def handle_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status_msg.delete()
         finally:
             for f in files:
-                f.close()
+                try:
+                    f.close()
+                except:
+                    pass
 
         for path in image_paths:
             try:
