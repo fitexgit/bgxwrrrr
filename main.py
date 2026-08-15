@@ -2,17 +2,16 @@ import os
 import asyncio
 import logging
 from pathlib import Path
-from dotenv import load_dotenv
 from telegram import Update, InputMediaPhoto
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
-# بارگذاری توکن از فایل .env
-load_dotenv()
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+# ==================== توکن برای تست ====================
+TOKEN = "7534267402:AAFaOmAaFbVmdpdC6RjKjV-71evLGVwd5Oc"
+# ======================================================
 
-if not TOKEN:
-    raise ValueError("❌ توکن ربات پیدا نشد! فایل .env را چک کنید.")
+if not TOKEN or ":" not in TOKEN:
+    raise ValueError("❌ توکن نامعتبر است!")
 
 # تنظیمات
 GENERATOR_URL = "https://perchance.org/ai-girl-image-generator"
@@ -39,10 +38,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("لغو شد.")
+    await update.message.reply_text("عملیات لغو شد.")
 
 
-async def generate_with_playwright(prompt: str, negative: str = "low quality, blurry, deformed, bad anatomy") -> list[Path]:
+async def generate_with_playwright(prompt: str, negative: str = "low quality, blurry, deformed, bad anatomy, extra limbs") -> list[Path]:
     """تولید تصویر با Playwright و برگرداندن لیست مسیر فایل‌ها"""
     image_paths = []
 
@@ -55,30 +54,36 @@ async def generate_with_playwright(prompt: str, negative: str = "low quality, bl
         page = await context.new_page()
 
         try:
+            print("در حال باز کردن صفحه...")
             await page.goto(GENERATOR_URL, wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_timeout(4000)
+            await page.wait_for_timeout(5000)
 
             # پر کردن Description
+            print("در حال نوشتن پرامپت...")
             desc = page.locator("textarea").first
-            await desc.wait_for(state="visible", timeout=15000)
+            await desc.wait_for(state="visible", timeout=20000)
             await desc.fill(prompt)
 
-            # سعی در پر کردن negative (اگر وجود داشت)
+            # سعی در پر کردن negative
             try:
                 negative_area = page.locator("text=Anti-Description").locator("..").locator("textarea").first
                 if await negative_area.count() > 0:
                     await negative_area.fill(negative)
-            except:
-                pass
+            except Exception as e:
+                print(f"نتوانست negative را پر کند: {e}")
 
             # کلیک Generate
+            print("در حال کلیک روی Generate...")
             generate_btn = page.locator("button:has-text('generate'), button:has-text('Generate')").first
+            await generate_btn.wait_for(state="visible", timeout=10000)
             await generate_btn.click()
 
             # صبر ۲.۵ دقیقه
+            print("منتظر ساخت تصاویر (حدود ۱۵۰ ثانیه)...")
             await page.wait_for_timeout(150000)
 
             # گرفتن تصاویر از iframeها
+            print("در حال جمع‌آوری تصاویر...")
             for frame in page.frames:
                 try:
                     imgs = await frame.locator("img").all()
@@ -95,9 +100,7 @@ async def generate_with_playwright(prompt: str, negative: str = "low quality, bl
                             with open(path, "wb") as f:
                                 f.write(data)
                             image_paths.append(path)
-                        elif "http" in src or "blob" in src:
-                            # در صورت نیاز می‌توان دانلود کرد
-                            pass
+                            print(f"تصویر ذخیره شد: {path}")
                 except Exception as e:
                     logger.warning(f"خطا در خواندن فریم: {e}")
                     continue
@@ -120,33 +123,40 @@ async def handle_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("پرامپت خیلی کوتاهه. لطفاً جزئیات بیشتری بنویس.")
         return
 
-    status_msg = await update.message.reply_text("⏳ در حال ساخت تصویر... (حدود ۲ تا ۳ دقیقه صبر کن)")
+    status_msg = await update.message.reply_text("⏳ در حال ساخت تصویر...\nحدود ۲ تا ۳ دقیقه صبر کن.")
 
     try:
         image_paths = await generate_with_playwright(prompt)
 
         if not image_paths:
-            await status_msg.edit_text("❌ هیچ تصویری ساخته نشد. دوباره امتحان کن یا پرامپت رو تغییر بده.")
+            await status_msg.edit_text("❌ هیچ تصویری ساخته نشد.\nممکنه سایت شلوغ باشه یا پرامپت مشکل داشته باشه. دوباره امتحان کن.")
             return
 
-        # ارسال تصاویر
+        # ارسال تصاویر (حداکثر ۹ تا)
         media = []
-        for path in image_paths[:9]:  # حداکثر ۹ تا
-            media.append(InputMediaPhoto(media=open(path, "rb")))
+        files_to_close = []
+        try:
+            for path in image_paths[:9]:
+                f = open(path, "rb")
+                files_to_close.append(f)
+                media.append(InputMediaPhoto(media=f))
 
-        await update.message.reply_media_group(media=media)
-        await status_msg.delete()
+            await update.message.reply_media_group(media=media)
+            await status_msg.delete()
+        finally:
+            for f in files_to_close:
+                f.close()
 
         # پاک کردن فایل‌های موقت
         for path in image_paths:
             try:
-                path.unlink()
+                path.unlink(missing_ok=True)
             except:
                 pass
 
     except Exception as e:
         error_text = f"❌ خطا رخ داد:\n`{str(e)}`"
-        logger.error(f"User {user.id} error: {e}")
+        logger.error(f"User {user.id} | Error: {e}")
         try:
             await status_msg.edit_text(error_text, parse_mode="Markdown")
         except:
@@ -154,14 +164,15 @@ async def handle_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
+    print("ربات در حال راه‌اندازی...")
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_prompt))
 
-    print("ربات شروع به کار کرد...")
-    app.run_polling()
+    print("✅ ربات شروع به کار کرد. منتظر پیام کاربران...")
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
