@@ -11,15 +11,10 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 TOKEN = "7534267402:AAFaOmAaFbVmdpdC6RjKjV-71evLGVwd5Oc"
 # ======================================================
 
-if not TOKEN or ":" not in TOKEN:
-    raise ValueError("❌ توکن نامعتبر است!")
-
-# تنظیمات
 GENERATOR_URL = "https://perchance.org/ai-girl-image-generator"
 OUTPUT_DIR = Path("generated_images")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-# لاگ
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
@@ -32,10 +27,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "سلام 👋\n"
         "پرامپت تصویر رو بفرست تا برات بسازم.\n\n"
         "مثال:\n"
-        "`cute korean girl, long black hair, soft smile, white sweater`\n\n"
-        "دستورات:\n"
-        "/start - شروع\n"
-        "/cancel - لغو",
+        "`cute korean girl, long black hair, soft smile, white sweater`",
         parse_mode="Markdown"
     )
 
@@ -45,7 +37,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def generate_with_playwright(prompt: str, negative: str = "low quality, blurry, deformed, bad anatomy, extra limbs, watermark") -> list[Path]:
-    """تولید تصویر با Playwright"""
     image_paths = []
 
     async with async_playwright() as p:
@@ -57,41 +48,100 @@ async def generate_with_playwright(prompt: str, negative: str = "low quality, bl
                 "--disable-dev-shm-usage",
                 "--disable-blink-features=AutomationControlled",
                 "--disable-gpu",
+                "--window-size=1280,900",
             ]
         )
         context = await browser.new_context(
             viewport={"width": 1280, "height": 900},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
             ignore_https_errors=True,
+            java_script_enabled=True,
         )
         page = await context.new_page()
 
         try:
             logger.info("در حال باز کردن صفحه...")
-            await page.goto(GENERATOR_URL, wait_until="domcontentloaded", timeout=120000)
-            await page.wait_for_timeout(8000)
+            await page.goto(GENERATOR_URL, wait_until="networkidle", timeout=180000)
+            
+            # صبر اضافی برای لود کامل جاوااسکریپت
+            await page.wait_for_timeout(12000)
 
-            logger.info("در حال نوشتن پرامپت...")
-            desc = page.locator("textarea").first
-            await desc.wait_for(state="visible", timeout=30000)
-            await desc.fill(prompt)
+            logger.info("در حال پیدا کردن فیلد پرامپت...")
 
-            # پر کردن negative (اگر وجود داشت)
+            # چند روش مختلف برای پیدا کردن textarea
+            textarea = None
+            selectors = [
+                "textarea",
+                "textarea[placeholder*='description' i]",
+                "textarea[placeholder*='prompt' i]",
+                "textarea[data-name='description']",
+                ".input-ctn textarea",
+                "#appEl textarea",
+            ]
+
+            for selector in selectors:
+                try:
+                    loc = page.locator(selector).first
+                    await loc.wait_for(state="visible", timeout=15000)
+                    textarea = loc
+                    logger.info(f"فیلد پیدا شد با سلکتور: {selector}")
+                    break
+                except:
+                    continue
+
+            if textarea is None:
+                # آخرین تلاش: همه textareaها را چک کن
+                all_textareas = await page.locator("textarea").all()
+                logger.info(f"تعداد textarea پیدا شده: {len(all_textareas)}")
+                if all_textareas:
+                    textarea = all_textareas[0]
+                else:
+                    # اسکرین‌شات برای دیباگ
+                    screenshot_path = OUTPUT_DIR / "debug_timeout.png"
+                    await page.screenshot(path=screenshot_path, full_page=True)
+                    raise Exception("هیچ فیلد متنی (textarea) پیدا نشد. احتمالاً صفحه کامل لود نشده.")
+
+            await textarea.click()
+            await textarea.fill("")
+            await textarea.fill(prompt)
+            logger.info("پرامپت نوشته شد.")
+
+            # سعی در نوشتن negative
             try:
-                negative_area = page.locator("text=Anti-Description").locator("..").locator("textarea").first
-                if await negative_area.count() > 0:
-                    await negative_area.fill(negative)
-            except Exception as e:
-                logger.warning(f"نتوانست negative را پر کند: {e}")
+                neg = page.locator("text=Anti-Description").locator("xpath=..").locator("textarea").first
+                if await neg.count() > 0:
+                    await neg.fill(negative)
+            except:
+                pass
 
-            logger.info("در حال کلیک روی Generate...")
-            generate_btn = page.locator("button:has-text('generate'), button:has-text('Generate')").first
-            await generate_btn.wait_for(state="visible", timeout=15000)
+            # پیدا کردن و کلیک دکمه Generate
+            logger.info("در حال پیدا کردن دکمه Generate...")
+            generate_btn = None
+            btn_selectors = [
+                "button:has-text('generate')",
+                "button:has-text('Generate')",
+                "button:has-text('Generate')",
+                "text=generate",
+                "button >> text=/generate/i",
+            ]
+
+            for sel in btn_selectors:
+                try:
+                    btn = page.locator(sel).first
+                    await btn.wait_for(state="visible", timeout=10000)
+                    generate_btn = btn
+                    break
+                except:
+                    continue
+
+            if generate_btn is None:
+                raise Exception("دکمه Generate پیدا نشد.")
+
             await generate_btn.click()
+            logger.info("دکمه Generate کلیک شد. منتظر ساخت تصاویر...")
 
-            # صبر برای ساخت تصاویر (۳ دقیقه)
-            logger.info("منتظر ساخت تصاویر (حدود ۱۸۰ ثانیه)...")
-            await page.wait_for_timeout(180000)
+            # صبر طولانی برای تولید تصویر
+            await page.wait_for_timeout(200000)  # حدود ۳ دقیقه و ۲۰ ثانیه
 
             logger.info("در حال جمع‌آوری تصاویر...")
             for frame in page.frames:
@@ -99,23 +149,27 @@ async def generate_with_playwright(prompt: str, negative: str = "low quality, bl
                     imgs = await frame.locator("img").all()
                     for img in imgs:
                         src = await img.get_attribute("src")
-                        if not src:
-                            continue
-
-                        if src.startswith("data:image"):
+                        if src and src.startswith("data:image"):
                             header, encoded = src.split(",", 1)
                             data = base64.b64decode(encoded)
                             path = OUTPUT_DIR / f"img_{len(image_paths)}_{os.urandom(4).hex()}.png"
                             with open(path, "wb") as f:
                                 f.write(data)
                             image_paths.append(path)
-                            logger.info(f"تصویر ذخیره شد: {path}")
+                            logger.info(f"تصویر ذخیره شد: {path.name}")
                 except Exception as e:
-                    logger.warning(f"خطا در خواندن فریم: {e}")
-                    continue
+                    logger.warning(f"خطا در فریم: {e}")
 
-        except PlaywrightTimeoutError:
-            raise Exception("زمان اتصال به سایت تمام شد (Timeout) - سایت ممکن است کند باشد یا IP محدود شده باشد")
+            if not image_paths:
+                # اسکرین‌شات نهایی برای دیباگ
+                await page.screenshot(path=OUTPUT_DIR / "debug_no_image.png", full_page=True)
+
+        except PlaywrightTimeoutError as e:
+            try:
+                await page.screenshot(path=OUTPUT_DIR / "debug_timeout.png", full_page=True)
+            except:
+                pass
+            raise Exception("زمان اتصال به سایت تمام شد (Timeout) - صفحه کامل لود نشد یا فیلدها پیدا نشدند")
         except Exception as e:
             raise Exception(f"خطا در تولید تصویر: {str(e)}")
         finally:
@@ -134,7 +188,7 @@ async def handle_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     status_msg = await update.message.reply_text(
         "⏳ در حال ساخت تصویر...\n"
-        "حدود ۲ تا ۳ دقیقه صبر کن.\n"
+        "حدود ۳ تا ۴ دقیقه صبر کن.\n"
         "لطفاً پیام جدید نفرست."
     )
 
@@ -144,30 +198,28 @@ async def handle_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not image_paths:
             await status_msg.edit_text(
                 "❌ هیچ تصویری ساخته نشد.\n"
-                "ممکنه سایت شلوغ باشه یا پرامپت مشکل داشته باشه.\n"
-                "لطفاً چند دقیقه دیگه دوباره امتحان کن."
+                "سایت ممکن است شلوغ باشد یا مشکل موقت داشته باشد.\n"
+                "چند دقیقه دیگر دوباره امتحان کن."
             )
             return
 
-        # ارسال تصاویر (حداکثر ۹ تا)
         media = []
-        files_to_close = []
+        files = []
         try:
             for path in image_paths[:9]:
                 f = open(path, "rb")
-                files_to_close.append(f)
+                files.append(f)
                 media.append(InputMediaPhoto(media=f))
 
             await update.message.reply_media_group(media=media)
             await status_msg.delete()
         finally:
-            for f in files_to_close:
+            for f in files:
                 try:
                     f.close()
                 except:
                     pass
 
-        # پاک کردن فایل‌های موقت
         for path in image_paths:
             try:
                 path.unlink(missing_ok=True)
@@ -191,7 +243,7 @@ def main():
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_prompt))
 
-    print("✅ ربات شروع به کار کرد. منتظر پیام کاربران...")
+    print("✅ ربات شروع به کار کرد.")
     app.run_polling(drop_pending_updates=True)
 
 
