@@ -22,13 +22,13 @@ logger = logging.getLogger(__name__)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "سلام 👋\nپرامپت تصویر رو بفرست تا برات بسازم.\n\nمثال:\n`cute korean girl, long black hair, soft smile`",
+        "سلام 👋\nپرامپت تصویر رو بفرست.\n\nمثال:\n`cute korean girl, long black hair, soft smile`",
         parse_mode="Markdown"
     )
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("عملیات لغو شد.")
+    await update.message.reply_text("لغو شد.")
 
 
 async def generate_with_playwright(prompt: str) -> list[Path]:
@@ -42,7 +42,6 @@ async def generate_with_playwright(prompt: str) -> list[Path]:
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-blink-features=AutomationControlled",
-                "--disable-gpu",
             ]
         )
         context = await browser.new_context(
@@ -53,72 +52,89 @@ async def generate_with_playwright(prompt: str) -> list[Path]:
         page = await context.new_page()
 
         try:
-            logger.info("۱. باز کردن صفحه...")
+            logger.info("باز کردن صفحه...")
             await page.goto(GENERATOR_URL, wait_until="domcontentloaded", timeout=120000)
-            await page.wait_for_timeout(12000)
+            await page.wait_for_timeout(15000)
 
-            logger.info("۲. نوشتن پرامپت...")
+            logger.info("ست کردن پرامپت...")
 
-            # نوشتن پرامپت + تریگر کردن همه eventهای لازم
+            # روش قوی‌تر برای ست کردن پرامپت در فریم‌ورک Perchance
             await page.evaluate(
                 """(promptText) => {
+                    // ۱. پیدا کردن textarea اصلی
                     const textareas = Array.from(document.querySelectorAll('textarea'));
-                    let target = textareas.find(t => t.offsetWidth > 100 && t.offsetHeight > 40);
-                    if (!target) target = textareas[0];
-                    if (!target) return false;
+                    let ta = textareas.find(t => t.offsetWidth > 150 && t.offsetHeight > 50);
+                    if (!ta) ta = textareas[0];
+                    if (!ta) return 'no-textarea';
 
-                    target.focus();
-                    target.value = '';
-                    target.value = promptText;
+                    // ۲. پاک کردن و نوشتن
+                    ta.focus();
+                    ta.value = '';
+                    ta.value = promptText;
 
-                    // تریگر کردن eventهای مهم برای فریم‌ورک Perchance
-                    ['input', 'change', 'keyup', 'blur'].forEach(evt => {
-                        target.dispatchEvent(new Event(evt, { bubbles: true }));
-                    });
-                    return true;
+                    // ۳. تریگر eventها
+                    ta.dispatchEvent(new Event('input', { bubbles: true }));
+                    ta.dispatchEvent(new Event('change', { bubbles: true }));
+
+                    // ۴. اگر فریم‌ورک از window.input استفاده می‌کند
+                    if (window.input) {
+                        window.input.description = promptText;
+                    }
+
+                    return 'ok';
                 }""",
                 prompt
             )
-            logger.info("پرامپت نوشته شد.")
+
             await page.wait_for_timeout(2000)
 
-            logger.info("۳. کلیک Generate...")
+            logger.info("کلیک روی Generate...")
 
-            await page.evaluate("""() => {
-                const btn = Array.from(document.querySelectorAll('button')).find(b => 
+            # چند روش برای کلیک
+            clicked = await page.evaluate("""() => {
+                // روش ۱: پیدا کردن دکمه با متن
+                let btn = Array.from(document.querySelectorAll('button')).find(b => 
                     b.innerText.toLowerCase().includes('generate')
                 );
+                
                 if (btn) {
                     btn.click();
-                    return true;
+                    return 'clicked-by-text';
                 }
-                return false;
-            }""")
-            logger.info("دکمه Generate کلیک شد.")
 
-            # صبر بیشتر
-            logger.info("۴. منتظر ساخت تصاویر (۳.۵ دقیقه)...")
+                // روش ۲: پیدا کردن دکمه‌ای که کلاس یا استایل خاصی دارد
+                btn = document.querySelector('button');
+                if (btn) {
+                    btn.click();
+                    return 'clicked-first-button';
+                }
+
+                return 'not-found';
+            }""")
+
+            logger.info(f"نتیجه کلیک: {clicked}")
+
+            # صبر طولانی
+            logger.info("منتظر تولید تصویر (۳.۵ دقیقه)...")
             await page.wait_for_timeout(210000)
 
-            logger.info("۵. جمع‌آوری تصاویر...")
+            # اسکرین‌شات بعد از صبر
+            await page.screenshot(path=OUTPUT_DIR / "after_generate.png", full_page=True)
+            logger.info("اسکرین‌شات after_generate.png ذخیره شد")
 
-            # اسکرین‌شات برای دیباگ
-            await page.screenshot(path=OUTPUT_DIR / "after_wait.png", full_page=True)
+            # جمع‌آوری تصاویر
+            logger.info("جمع‌آوری تصاویر...")
+            sources = [page] + list(page.frames)
 
-            # جمع‌آوری از همه جا
-            sources = [page] + page.frames
             for source in sources:
                 try:
-                    imgs = await source.locator("img").all()
-                    for img in imgs:
+                    for img in await source.locator("img").all():
                         src = await img.get_attribute("src")
-                        if not src:
-                            continue
-                        if src.startswith("data:image"):
+                        if src and src.startswith("data:image") and len(src) > 1000:
                             try:
                                 header, encoded = src.split(",", 1)
                                 data = base64.b64decode(encoded)
-                                if len(data) > 5000:  # فقط تصاویر واقعی (نه آیکون)
+                                if len(data) > 8000:  # فیلتر کردن آیکون‌های کوچک
                                     path = OUTPUT_DIR / f"img_{len(image_paths)}_{os.urandom(3).hex()}.png"
                                     with open(path, "wb") as f:
                                         f.write(data)
@@ -129,11 +145,11 @@ async def generate_with_playwright(prompt: str) -> list[Path]:
                 except:
                     continue
 
-            logger.info(f"تعداد تصاویر پیدا شده: {len(image_paths)}")
+            logger.info(f"تعداد کل تصاویر: {len(image_paths)}")
 
         except Exception as e:
             try:
-                await page.screenshot(path=OUTPUT_DIR / "debug_error.png", full_page=True)
+                await page.screenshot(path=OUTPUT_DIR / "error.png", full_page=True)
             except:
                 pass
             raise Exception(str(e))
@@ -146,43 +162,40 @@ async def generate_with_playwright(prompt: str) -> list[Path]:
 async def handle_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prompt = update.message.text.strip()
     if len(prompt) < 3:
-        await update.message.reply_text("پرامپت خیلی کوتاهه.")
+        await update.message.reply_text("پرامپت کوتاهه.")
         return
 
-    status_msg = await update.message.reply_text("⏳ در حال ساخت تصویر...\nحدود ۳.۵ دقیقه صبر کن.")
+    status = await update.message.reply_text("⏳ در حال ساخت...\nحدود ۳.۵ دقیقه صبر کن.")
 
     try:
-        image_paths = await generate_with_playwright(prompt)
+        paths = await generate_with_playwright(prompt)
 
-        if not image_paths:
-            await status_msg.edit_text("❌ تصویری ساخته نشد.\nفایل after_wait.png را چک کن.")
+        if not paths:
+            await status.edit_text("❌ تصویری ساخته نشد.\nفایل after_generate.png را چک کن.")
             return
 
         media = []
         files = []
         try:
-            for path in image_paths[:8]:
-                f = open(path, "rb")
+            for p in paths[:8]:
+                f = open(p, "rb")
                 files.append(f)
                 media.append(InputMediaPhoto(media=f))
             await update.message.reply_media_group(media=media)
-            await status_msg.delete()
+            await status.delete()
         finally:
             for f in files:
                 f.close()
 
-        for path in image_paths:
+        for p in paths:
             try:
-                path.unlink(missing_ok=True)
+                p.unlink(missing_ok=True)
             except:
                 pass
 
     except Exception as e:
         logger.error(str(e))
-        try:
-            await status_msg.edit_text(f"❌ خطا:\n`{str(e)}`", parse_mode="Markdown")
-        except:
-            await update.message.reply_text(f"❌ خطا: {str(e)}")
+        await status.edit_text(f"❌ خطا:\n`{e}`", parse_mode="Markdown")
 
 
 def main():
@@ -190,7 +203,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_prompt))
-    print("✅ ربات آماده است.")
+    print("✅ ربات آماده است")
     app.run_polling(drop_pending_updates=True)
 
 
