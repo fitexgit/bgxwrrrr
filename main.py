@@ -7,9 +7,7 @@ from telegram import Update, InputMediaPhoto
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from playwright.async_api import async_playwright
 
-# ==================== توکن ====================
 TOKEN = "7534267402:AAFaOmAaFbVmdpdC6RjKjV-71evLGVwd5Oc"
-# ==============================================
 
 GENERATOR_URL = "https://perchance.org/ai-girl-image-generator"
 OUTPUT_DIR = Path("generated_images")
@@ -48,7 +46,7 @@ async def generate_with_playwright(prompt: str) -> list[Path]:
             ]
         )
         context = await browser.new_context(
-            viewport={"width": 1280, "height": 900},
+            viewport={"width": 1400, "height": 1000},
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
             ignore_https_errors=True,
         )
@@ -57,101 +55,81 @@ async def generate_with_playwright(prompt: str) -> list[Path]:
         try:
             logger.info("۱. باز کردن صفحه...")
             await page.goto(GENERATOR_URL, wait_until="domcontentloaded", timeout=120000)
-            await page.wait_for_timeout(15000)  # صبر بیشتر برای لود کامل
+            await page.wait_for_timeout(12000)
 
-            logger.info("۲. نوشتن پرامپت با JavaScript...")
+            logger.info("۲. نوشتن پرامپت...")
 
-            # روش قدرتمند: مستقیم با JS مقدار را می‌گذاریم (از مشکل visible بودن رد می‌شویم)
-            success = await page.evaluate(
+            # نوشتن پرامپت + تریگر کردن همه eventهای لازم
+            await page.evaluate(
                 """(promptText) => {
                     const textareas = Array.from(document.querySelectorAll('textarea'));
-                    
-                    // اول سعی می‌کنیم textareaی که واقعاً دیده می‌شود را پیدا کنیم
-                    let target = textareas.find(t => {
-                        const style = window.getComputedStyle(t);
-                        return style.display !== 'none' && 
-                               style.visibility !== 'hidden' && 
-                               t.offsetWidth > 50 && 
-                               t.offsetHeight > 30;
-                    });
-
-                    // اگر پیدا نشد، اولین textarea بزرگ را بردار
-                    if (!target) {
-                        target = textareas.find(t => t.offsetHeight > 40) || textareas[0];
-                    }
-
+                    let target = textareas.find(t => t.offsetWidth > 100 && t.offsetHeight > 40);
+                    if (!target) target = textareas[0];
                     if (!target) return false;
 
-                    // مقدار را مستقیم ست می‌کنیم
-                    target.value = promptText;
-                    target.dispatchEvent(new Event('input', { bubbles: true }));
-                    target.dispatchEvent(new Event('change', { bubbles: true }));
                     target.focus();
+                    target.value = '';
+                    target.value = promptText;
+
+                    // تریگر کردن eventهای مهم برای فریم‌ورک Perchance
+                    ['input', 'change', 'keyup', 'blur'].forEach(evt => {
+                        target.dispatchEvent(new Event(evt, { bubbles: true }));
+                    });
                     return true;
                 }""",
                 prompt
             )
+            logger.info("پرامپت نوشته شد.")
+            await page.wait_for_timeout(2000)
 
-            if not success:
-                raise Exception("نتوانست فیلد Description را پیدا و پر کند")
+            logger.info("۳. کلیک Generate...")
 
-            logger.info("پرامپت با موفقیت نوشته شد.")
-            await page.wait_for_timeout(1500)
-
-            logger.info("۳. کلیک روی دکمه Generate...")
-
-            # کلیک روی دکمه Generate با JS (مطمئن‌تر)
-            clicked = await page.evaluate("""() => {
-                const buttons = Array.from(document.querySelectorAll('button'));
-                const generateBtn = buttons.find(btn => 
-                    btn.textContent.toLowerCase().includes('generate')
+            await page.evaluate("""() => {
+                const btn = Array.from(document.querySelectorAll('button')).find(b => 
+                    b.innerText.toLowerCase().includes('generate')
                 );
-                if (generateBtn) {
-                    generateBtn.click();
+                if (btn) {
+                    btn.click();
                     return true;
                 }
                 return false;
             }""")
-
-            if not clicked:
-                # روش جایگزین
-                btn = page.locator("button:has-text('generate')").first
-                await btn.click(force=True, timeout=10000)
-
             logger.info("دکمه Generate کلیک شد.")
 
-            # صبر برای تولید تصویر
-            logger.info("۴. منتظر ساخت تصاویر (۳ دقیقه)...")
-            await page.wait_for_timeout(180000)
+            # صبر بیشتر
+            logger.info("۴. منتظر ساخت تصاویر (۳.۵ دقیقه)...")
+            await page.wait_for_timeout(210000)
 
             logger.info("۵. جمع‌آوری تصاویر...")
 
-            # جمع‌آوری از صفحه + فریم‌ها
-            async def collect_images(source):
+            # اسکرین‌شات برای دیباگ
+            await page.screenshot(path=OUTPUT_DIR / "after_wait.png", full_page=True)
+
+            # جمع‌آوری از همه جا
+            sources = [page] + page.frames
+            for source in sources:
                 try:
                     imgs = await source.locator("img").all()
                     for img in imgs:
                         src = await img.get_attribute("src")
-                        if src and src.startswith("data:image"):
-                            header, encoded = src.split(",", 1)
-                            data = base64.b64decode(encoded)
-                            path = OUTPUT_DIR / f"img_{len(image_paths)}_{os.urandom(4).hex()}.png"
-                            with open(path, "wb") as f:
-                                f.write(data)
-                            image_paths.append(path)
-                            logger.info(f"تصویر ذخیره شد: {path.name}")
+                        if not src:
+                            continue
+                        if src.startswith("data:image"):
+                            try:
+                                header, encoded = src.split(",", 1)
+                                data = base64.b64decode(encoded)
+                                if len(data) > 5000:  # فقط تصاویر واقعی (نه آیکون)
+                                    path = OUTPUT_DIR / f"img_{len(image_paths)}_{os.urandom(3).hex()}.png"
+                                    with open(path, "wb") as f:
+                                        f.write(data)
+                                    image_paths.append(path)
+                                    logger.info(f"تصویر ذخیره شد: {path.name}")
+                            except:
+                                pass
                 except:
-                    pass
+                    continue
 
-            await collect_images(page)
-
-            if not image_paths:
-                for frame in page.frames:
-                    await collect_images(frame)
-
-            if not image_paths:
-                await page.screenshot(path=OUTPUT_DIR / "debug_no_images.png", full_page=True)
-                logger.warning("هیچ تصویری پیدا نشد.")
+            logger.info(f"تعداد تصاویر پیدا شده: {len(image_paths)}")
 
         except Exception as e:
             try:
@@ -166,20 +144,18 @@ async def generate_with_playwright(prompt: str) -> list[Path]:
 
 
 async def handle_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
     prompt = update.message.text.strip()
-
     if len(prompt) < 3:
         await update.message.reply_text("پرامپت خیلی کوتاهه.")
         return
 
-    status_msg = await update.message.reply_text("⏳ در حال ساخت تصویر...\nحدود ۳ دقیقه صبر کن.")
+    status_msg = await update.message.reply_text("⏳ در حال ساخت تصویر...\nحدود ۳.۵ دقیقه صبر کن.")
 
     try:
         image_paths = await generate_with_playwright(prompt)
 
         if not image_paths:
-            await status_msg.edit_text("❌ تصویری ساخته نشد.\nممکنه سایت شلوغ باشه. چند دقیقه دیگر دوباره امتحان کن.")
+            await status_msg.edit_text("❌ تصویری ساخته نشد.\nفایل after_wait.png را چک کن.")
             return
 
         media = []
@@ -193,10 +169,7 @@ async def handle_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status_msg.delete()
         finally:
             for f in files:
-                try:
-                    f.close()
-                except:
-                    pass
+                f.close()
 
         for path in image_paths:
             try:
@@ -205,15 +178,14 @@ async def handle_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
 
     except Exception as e:
-        logger.error(f"User {user.id} | {e}")
+        logger.error(str(e))
         try:
-            await status_msg.edit_text(f"❌ خطا رخ داد:\n`{str(e)}`", parse_mode="Markdown")
+            await status_msg.edit_text(f"❌ خطا:\n`{str(e)}`", parse_mode="Markdown")
         except:
             await update.message.reply_text(f"❌ خطا: {str(e)}")
 
 
 def main():
-    print("ربات در حال راه‌اندازی...")
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("cancel", cancel))
