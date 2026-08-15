@@ -57,85 +57,97 @@ async def generate_with_playwright(prompt: str) -> list[Path]:
         try:
             logger.info("۱. باز کردن صفحه...")
             await page.goto(GENERATOR_URL, wait_until="domcontentloaded", timeout=120000)
-            await page.wait_for_timeout(12000)
+            await page.wait_for_timeout(15000)  # صبر بیشتر برای لود کامل
 
-            logger.info("۲. پیدا کردن textareaهای قابل مشاهده...")
+            logger.info("۲. نوشتن پرامپت با JavaScript...")
 
-            # فقط textareaهایی که واقعاً visible هستند
-            visible_textareas = page.locator("textarea:visible")
-            count = await visible_textareas.count()
-            logger.info(f"تعداد textarea visible: {count}")
+            # روش قدرتمند: مستقیم با JS مقدار را می‌گذاریم (از مشکل visible بودن رد می‌شویم)
+            success = await page.evaluate(
+                """(promptText) => {
+                    const textareas = Array.from(document.querySelectorAll('textarea'));
+                    
+                    // اول سعی می‌کنیم textareaی که واقعاً دیده می‌شود را پیدا کنیم
+                    let target = textareas.find(t => {
+                        const style = window.getComputedStyle(t);
+                        return style.display !== 'none' && 
+                               style.visibility !== 'hidden' && 
+                               t.offsetWidth > 50 && 
+                               t.offsetHeight > 30;
+                    });
 
-            if count == 0:
-                # اگر هیچ‌کدام visible نبود، با force کار می‌کنیم
-                logger.warning("هیچ textarea visible پیدا نشد، از روش force استفاده می‌کنم...")
-                all_textareas = page.locator("textarea")
-                count = await all_textareas.count()
-                logger.info(f"تعداد کل textarea: {count}")
-                if count == 0:
-                    raise Exception("هیچ فیلد متنی پیدا نشد")
-                desc = all_textareas.first
-            else:
-                # معمولاً اولین textarea visible همان Description است
-                desc = visible_textareas.first
+                    // اگر پیدا نشد، اولین textarea بزرگ را بردار
+                    if (!target) {
+                        target = textareas.find(t => t.offsetHeight > 40) || textareas[0];
+                    }
 
-            # پر کردن پرامپت (با force برای اطمینان)
-            await desc.click(force=True)
-            await desc.fill("")
-            await desc.fill(prompt, force=True)
+                    if (!target) return false;
+
+                    // مقدار را مستقیم ست می‌کنیم
+                    target.value = promptText;
+                    target.dispatchEvent(new Event('input', { bubbles: true }));
+                    target.dispatchEvent(new Event('change', { bubbles: true }));
+                    target.focus();
+                    return true;
+                }""",
+                prompt
+            )
+
+            if not success:
+                raise Exception("نتوانست فیلد Description را پیدا و پر کند")
+
             logger.info("پرامپت با موفقیت نوشته شد.")
-
-            # کمی صبر
-            await page.wait_for_timeout(1000)
+            await page.wait_for_timeout(1500)
 
             logger.info("۳. کلیک روی دکمه Generate...")
 
-            # دکمه Generate
-            generate_btn = page.locator("button:has-text('generate')").first
-            await generate_btn.wait_for(state="visible", timeout=15000)
-            await generate_btn.click(force=True)
+            # کلیک روی دکمه Generate با JS (مطمئن‌تر)
+            clicked = await page.evaluate("""() => {
+                const buttons = Array.from(document.querySelectorAll('button'));
+                const generateBtn = buttons.find(btn => 
+                    btn.textContent.toLowerCase().includes('generate')
+                );
+                if (generateBtn) {
+                    generateBtn.click();
+                    return true;
+                }
+                return false;
+            }""")
+
+            if not clicked:
+                # روش جایگزین
+                btn = page.locator("button:has-text('generate')").first
+                await btn.click(force=True, timeout=10000)
+
             logger.info("دکمه Generate کلیک شد.")
 
             # صبر برای تولید تصویر
-            logger.info("۴. منتظر ساخت تصاویر (حدود ۳ دقیقه)...")
+            logger.info("۴. منتظر ساخت تصاویر (۳ دقیقه)...")
             await page.wait_for_timeout(180000)
 
             logger.info("۵. جمع‌آوری تصاویر...")
 
-            # روش ۱: تصاویر داخل صفحه اصلی
-            imgs = await page.locator("img").all()
-            for img in imgs:
+            # جمع‌آوری از صفحه + فریم‌ها
+            async def collect_images(source):
                 try:
-                    src = await img.get_attribute("src")
-                    if src and src.startswith("data:image"):
-                        header, encoded = src.split(",", 1)
-                        data = base64.b64decode(encoded)
-                        path = OUTPUT_DIR / f"img_{len(image_paths)}_{os.urandom(4).hex()}.png"
-                        with open(path, "wb") as f:
-                            f.write(data)
-                        image_paths.append(path)
-                        logger.info(f"تصویر ذخیره شد: {path.name}")
+                    imgs = await source.locator("img").all()
+                    for img in imgs:
+                        src = await img.get_attribute("src")
+                        if src and src.startswith("data:image"):
+                            header, encoded = src.split(",", 1)
+                            data = base64.b64decode(encoded)
+                            path = OUTPUT_DIR / f"img_{len(image_paths)}_{os.urandom(4).hex()}.png"
+                            with open(path, "wb") as f:
+                                f.write(data)
+                            image_paths.append(path)
+                            logger.info(f"تصویر ذخیره شد: {path.name}")
                 except:
-                    continue
+                    pass
 
-            # روش ۲: اگر چیزی پیدا نشد، داخل فریم‌ها بگرد
+            await collect_images(page)
+
             if not image_paths:
-                logger.info("در حال جستجو داخل iframeها...")
                 for frame in page.frames:
-                    try:
-                        frame_imgs = await frame.locator("img").all()
-                        for img in frame_imgs:
-                            src = await img.get_attribute("src")
-                            if src and src.startswith("data:image"):
-                                header, encoded = src.split(",", 1)
-                                data = base64.b64decode(encoded)
-                                path = OUTPUT_DIR / f"img_{len(image_paths)}_{os.urandom(4).hex()}.png"
-                                with open(path, "wb") as f:
-                                    f.write(data)
-                                image_paths.append(path)
-                                logger.info(f"تصویر از فریم ذخیره شد: {path.name}")
-                    except:
-                        continue
+                    await collect_images(frame)
 
             if not image_paths:
                 await page.screenshot(path=OUTPUT_DIR / "debug_no_images.png", full_page=True)
@@ -167,7 +179,7 @@ async def handle_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         image_paths = await generate_with_playwright(prompt)
 
         if not image_paths:
-            await status_msg.edit_text("❌ تصویری ساخته نشد.\nچند دقیقه دیگر دوباره امتحان کن.")
+            await status_msg.edit_text("❌ تصویری ساخته نشد.\nممکنه سایت شلوغ باشه. چند دقیقه دیگر دوباره امتحان کن.")
             return
 
         media = []
